@@ -1,0 +1,111 @@
+version: "3.9"
+
+x-customizable_image: &customizable_image
+  image: ${CUSTOM_IMAGE:-frappe/erpnext}:${CUSTOM_TAG:-${ERPNEXT_VERSION:-version-15}}
+  # Build a custom image that bakes in apps from apps.json (via APPS_JSON_BASE64)
+  build:
+    context: .
+    dockerfile: images/layered/Containerfile
+    args:
+      FRAPPE_PATH: https://github.com/frappe/frappe
+      FRAPPE_BRANCH: ${FRAPPE_BRANCH:-version-15}
+      APPS_JSON_BASE64: ${APPS_JSON_BASE64}
+
+services:
+  mariadb:
+    image: mariadb:10.6
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - db-data:/var/lib/mysql
+    restart: unless-stopped
+
+  redis-cache:
+    image: redis:7
+    command: ["redis-server", "--save", ""]
+    volumes: [redis-cache-data:/data]
+    restart: unless-stopped
+
+  redis-queue:
+    image: redis:7
+    command: ["redis-server", "--save", ""]
+    volumes: [redis-queue-data:/data]
+    restart: unless-stopped
+
+  configurator:
+    <<: *customizable_image
+    entrypoint: ["bash","-c"]
+    command: >
+      ls -1 apps > sites/apps.txt;
+      bench set-config -g db_host $DB_HOST;
+      bench set-config -gp db_port $DB_PORT;
+      bench set-config -g redis_cache "redis://$REDIS_CACHE";
+      bench set-config -g redis_queue "redis://$REDIS_QUEUE";
+      bench set-config -gp socketio_port $SOCKETIO_PORT;
+    environment:
+      DB_HOST: mariadb
+      DB_PORT: 3306
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      SOCKETIO_PORT: 9000
+    volumes: [sites:/home/frappe/frappe-bench/sites]
+    depends_on: [mariadb, redis-cache, redis-queue]
+    restart: on-failure
+
+  backend:
+    <<: *customizable_image
+    command: ["bench","serve","--port","8000"]
+    volumes: [sites:/home/frappe/frappe-bench/sites]
+    depends_on: [configurator]
+    restart: unless-stopped
+
+  websocket:
+    <<: *customizable_image
+    command: ["node","/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    volumes: [sites:/home/frappe/frappe-bench/sites]
+    depends_on: [configurator]
+    restart: unless-stopped
+
+  frontend:
+    <<: *customizable_image
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$${host}}
+      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+    volumes: [sites:/home/frappe/frappe-bench/sites]
+    depends_on: [backend, websocket]
+    restart: unless-stopped
+    # No ports: Coolify's proxy will handle routing to internal port 8080.
+
+  queue-short:
+    <<: *customizable_image
+    command: ["bench","worker","--queue","short,default"]
+    volumes: [sites:/home/frappe/frappe-bench/sites]
+    depends_on: [configurator]
+    restart: unless-stopped
+
+  queue-long:
+    <<: *customizable_image
+    command: ["bench","worker","--queue","long,default,short"]
+    volumes: [sites:/home/frappe/frappe-bench/sites]
+    depends_on: [configurator]
+    restart: unless-stopped
+
+  scheduler:
+    <<: *customizable_image
+    command: ["bench","schedule"]
+    volumes: [sites:/home/frappe/frappe-bench/sites]
+    depends_on: [configurator]
+    restart: unless-stopped
+
+volumes:
+  sites:
+  db-data:
+  redis-cache-data:
+  redis-queue-data:
